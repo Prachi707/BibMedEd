@@ -105,6 +105,7 @@ cp .env.example .env
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BIBMEDED_PUBMED_API_KEY` | *(empty)* | Optional. Register free at [NCBI](https://www.ncbi.nlm.nih.gov/account/). With a key, PubMed requests run at 10 req/s; without one, at 3 req/s |
+| `BIBMEDED_NCBI_EMAIL` | *(empty)* | Optional contact email sent to NCBI on every PubMed search/fetch request. Requests identify the tool as `bibmeded`; blank email and API-key values are omitted. |
 | `BIBMEDED_PUBMED_RATE_LIMIT` | *(empty)* | Optional. PubMed requests per second. Empty means 10 with a key and 3 without. A value here must be a positive finite number, always wins and is not capped, so stay within NCBI's limits |
 | `BIBMEDED_OPENALEX_EMAIL` | *(empty)* | Optional. Sent to OpenAlex as `mailto=` |
 | `BIBMEDED_CROSSREF_EMAIL` | *(empty)* | Optional. Sent to CrossRef as `mailto=` |

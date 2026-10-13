@@ -348,10 +348,11 @@ def test_adapter_kwargs_unknown_source_returns_empty_dict():
 def test_adapter_kwargs_pubmed_reflects_configured_api_key_and_rate_limit(monkeypatch):
     monkeypatch.setattr(settings, "pubmed_api_key", "pm-key-123")
     monkeypatch.setattr(settings, "pubmed_rate_limit", 9.5)
+    monkeypatch.setattr(settings, "ncbi_email", "team@example.org")
 
     kwargs = tasks._adapter_kwargs("pubmed")
 
-    assert kwargs == {"api_key": "pm-key-123", "rate_limit": 9.5}
+    assert kwargs == {"api_key": "pm-key-123", "rate_limit": 9.5, "email": "team@example.org"}
 
 
 @pytest.mark.parametrize(("api_key", "expected_rate"), [("pm-key-123", 10.0), ("", 3.0)])
@@ -361,7 +362,7 @@ def test_adapter_kwargs_pubmed_derives_rate_from_api_key_when_rate_unset(
     monkeypatch.setattr(settings, "pubmed_api_key", api_key)
     monkeypatch.setattr(settings, "pubmed_rate_limit", None)
 
-    assert tasks._adapter_kwargs("pubmed") == {"api_key": api_key, "rate_limit": expected_rate}
+    assert tasks._adapter_kwargs("pubmed") == {"api_key": api_key, "rate_limit": expected_rate, "email": settings.ncbi_email}
 
 
 def _search_step_parameters(db, query_id: int) -> dict:
@@ -407,7 +408,7 @@ def test_run_search_logs_effective_pubmed_rate_in_search_step(
     )
 
     db.expire_all()
-    assert adapter_calls == [{"api_key": api_key, "rate_limit": expected_rate}]
+    assert adapter_calls == [{"api_key": api_key, "rate_limit": expected_rate, "email": settings.ncbi_email}]
     assert _search_step_parameters(db, query.id)["rate_limit_per_second"] == expected_rate
 
 
