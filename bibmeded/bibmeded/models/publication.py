@@ -1,7 +1,11 @@
 from datetime import datetime
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import JSON, Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from bibmeded.database import Base
+
+SCREENING_STAGES = ("title_abstract", "full_text")
+# PRISMA 2020 counts this reason as "Reports not retrieved", a full-text-stage box.
+NOT_RETRIEVED_REASON = "fulltext_unavailable"
 
 
 class Publication(Base):
@@ -14,6 +18,10 @@ class Publication(Base):
     __table_args__ = (
         UniqueConstraint("project_id", "pmid", name="uq_publications_project_pmid"),
         UniqueConstraint("project_id", "doi", name="uq_publications_project_doi"),
+        CheckConstraint(
+            "screening_stage IS NULL OR screening_stage IN ('title_abstract', 'full_text')",
+            name="ck_publications_screening_stage",
+        ),
     )
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     pmid: Mapped[str] = mapped_column(String(50), index=True)
@@ -36,13 +44,21 @@ class Publication(Base):
     project_id: Mapped[int] = mapped_column(ForeignKey("search_projects.id", ondelete="CASCADE"), index=True)
     excluded: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", index=True)
     exclusion_reason: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # PRISMA 2020 stage the exclusion was made at; NULL while the record is included.
+    screening_stage: Mapped[str | None] = mapped_column(String(20), nullable=True)
     # Raw reference list from the adapter. Each entry is a source-native identifier
     # (PMID for PubMed, DOI for CrossRef, OpenAlex ID for OpenAlex). Used at analysis
     # time to build bibliographic-coupling and co-citation networks against in-corpus
     # publications.
     external_references: Mapped[list | None] = mapped_column(JSON, nullable=True)
     journal: Mapped["Journal | None"] = relationship(back_populates="publications")
-    authors: Mapped[list["Author"]] = relationship(secondary="publication_authors", back_populates="publications")
+    # Author order drives first-author fields in every export (WoS AU and the bibliometrix
+    # SR key, RIS AU), so it must follow the source order stored at ingest, not row order.
+    authors: Mapped[list["Author"]] = relationship(
+        secondary="publication_authors",
+        back_populates="publications",
+        order_by="publication_authors.c.author_position",
+    )
     keywords: Mapped[list["Keyword"]] = relationship(secondary="publication_keywords", back_populates="publications")
     outgoing_citations: Mapped[list["Citation"]] = relationship(foreign_keys="Citation.citing_publication_id", back_populates="citing_publication")
     incoming_citations: Mapped[list["Citation"]] = relationship(foreign_keys="Citation.cited_publication_id", back_populates="cited_publication")

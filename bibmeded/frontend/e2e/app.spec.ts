@@ -1,5 +1,14 @@
 import { expect, test, type Page } from "@playwright/test";
-import { installMockApi } from "./mock-api";
+import { analysisResults, installMockApi, sampleQueryString } from "./mock-api";
+
+type GrowthSummaryOverride = {
+  cagr: number | null;
+  doubling_time_years: number | null;
+  start_year: number | null;
+  end_year: number | null;
+  excluded_current_year: boolean;
+  reason: string | null;
+};
 
 function collectRuntimeErrors(page: Page) {
   const errors: string[] = [];
@@ -10,6 +19,25 @@ function collectRuntimeErrors(page: Page) {
     }
   });
   return errors;
+}
+
+async function overridePublicationGrowthSummary(page: Page, growthSummary: GrowthSummaryOverride) {
+  await page.route("**/api/projects/1/analysis/publications", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: 1,
+        project_id: 1,
+        analysis_type: "publications",
+        results: {
+          ...analysisResults.publications,
+          growth_summary: growthSummary,
+        },
+        created_at: "2026-08-23T12:00:00Z",
+      }),
+    }),
+  );
 }
 
 test("sample project opens a complete dashboard", async ({ page }) => {
@@ -23,7 +51,119 @@ test("sample project opens a complete dashboard", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Analysis Overview" })).toBeVisible();
   await expect(page.getByText("AI in Medical Education — Sample Project")).toBeVisible();
   await expect(page.getByText("Marcus Chen Sample — 5")).toBeAttached();
+  await expect(page.getByRole("group", { name: "Publication growth summary" })).toBeVisible();
+  await expect(page.getByText("CAGR")).toBeVisible();
+  await expect(page.getByText("41.42%")).toBeVisible();
+  await expect(page.getByText("Doubling time")).toBeVisible();
+  await expect(page.getByText("2 years", { exact: true })).toBeVisible();
+  await expect(page.getByText("Growth window 2018–2020")).toBeVisible();
   expect(errors).toEqual([]);
+});
+
+test("publication trends notes when current incomplete year is excluded", async ({ page }) => {
+  await installMockApi(page);
+  await overridePublicationGrowthSummary(page, {
+    cagr: 50,
+    doubling_time_years: 1.71,
+    start_year: 2023,
+    end_year: 2025,
+    excluded_current_year: true,
+    reason: null,
+  });
+
+  await page.goto("/projects/1/dashboard");
+
+  await expect(page.getByText("Current incomplete year excluded from growth calculations.")).toBeVisible();
+});
+
+test("publication trends shows null metric reasons without hiding zero values", async ({ page }) => {
+  await installMockApi(page);
+  await overridePublicationGrowthSummary(page, {
+    cagr: 0,
+    doubling_time_years: null,
+    start_year: 2018,
+    end_year: 2020,
+    excluded_current_year: false,
+    reason: "Doubling time is not defined for non-positive growth (CAGR <= 0).",
+  });
+
+  await page.goto("/projects/1/dashboard");
+
+  await expect(page.getByText("0%", { exact: true })).toBeVisible();
+  await expect(page.getByText("Doubling time is not defined for non-positive growth (CAGR <= 0).")).toBeVisible();
+  await expect(page.getByText("NaN")).toHaveCount(0);
+});
+
+test("publication trends uses the singular unit for a one-year doubling time", async ({ page }) => {
+  await installMockApi(page);
+  await overridePublicationGrowthSummary(page, {
+    cagr: 100,
+    doubling_time_years: 1,
+    start_year: 2018,
+    end_year: 2020,
+    excluded_current_year: false,
+    reason: null,
+  });
+
+  await page.goto("/projects/1/dashboard");
+
+  await expect(page.getByText("1 year", { exact: true })).toBeVisible();
+  await expect(page.getByText("1 years")).toHaveCount(0);
+});
+
+test("publication trends never shows a negative zero CAGR", async ({ page }) => {
+  await installMockApi(page);
+  await overridePublicationGrowthSummary(page, {
+    cagr: -0.001,
+    doubling_time_years: null,
+    start_year: 2018,
+    end_year: 2020,
+    excluded_current_year: false,
+    reason: "Doubling time is not defined for non-positive growth (CAGR <= 0).",
+  });
+
+  await page.goto("/projects/1/dashboard");
+
+  await expect(page.getByText("0%", { exact: true })).toBeVisible();
+  await expect(page.getByText("-0%")).toHaveCount(0);
+});
+
+test("publication trends shows CAGR null reasons without hiding zero doubling time", async ({ page }) => {
+  await installMockApi(page);
+  await overridePublicationGrowthSummary(page, {
+    cagr: null,
+    doubling_time_years: 0,
+    start_year: 2018,
+    end_year: 2020,
+    excluded_current_year: false,
+    reason: "CAGR is undefined because the first full calendar year has zero publications.",
+  });
+
+  await page.goto("/projects/1/dashboard");
+
+  await expect(page.getByText("0 years", { exact: true })).toBeVisible();
+  await expect(page.getByText("CAGR is undefined because the first full calendar year has zero publications.")).toBeVisible();
+  await expect(page.locator("[aria-describedby]", { hasText: "not available" })).toHaveAccessibleDescription(
+    "CAGR is undefined because the first full calendar year has zero publications.",
+  );
+  await expect(page.getByText("NaN")).toHaveCount(0);
+});
+
+test("publication trends shows a shared reason once when both growth metrics are null", async ({ page }) => {
+  await installMockApi(page);
+  await overridePublicationGrowthSummary(page, {
+    cagr: null,
+    doubling_time_years: null,
+    start_year: 2029,
+    end_year: 2029,
+    excluded_current_year: false,
+    reason: "At least two full calendar years of data are required to compute CAGR.",
+  });
+
+  await page.goto("/projects/1/dashboard");
+
+  await expect(page.getByText("At least two full calendar years of data are required to compute CAGR.")).toHaveCount(1);
+  await expect(page.getByText("NaN")).toHaveCount(0);
 });
 
 test("new project gives an inline date correction and continues to search", async ({ page }) => {
@@ -79,6 +219,22 @@ test("search builder exposes labels and selected options", async ({ page }) => {
   await expect(page.getByRole("textbox", { name: "Raw query" })).toBeVisible();
 });
 
+test("sample project search page shows its stored strategy", async ({ page }) => {
+  const { writeRequests } = await installMockApi(page, { sampleSearch: true });
+  await page.goto("/projects/1/search");
+
+  await expect(page.getByRole("textbox", { name: "Raw query" })).toHaveValue(sampleQueryString);
+  await expect(page.getByRole("button", { name: "Advanced Query (Raw)" })).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByText("Loaded from the bundled sample project's search strategy")).toBeVisible();
+
+  await page.getByRole("button", { name: "Query Builder" }).click();
+  await page.getByRole("button", { name: "Discard edits" }).click();
+  await expect(page.getByRole("spinbutton", { name: "Start year" })).toHaveValue("2018");
+  await expect(page.getByRole("spinbutton", { name: "End year" })).toHaveValue("2025");
+  await expect(page.getByRole("radio", { name: "PubMed" })).toBeChecked();
+  expect(writeRequests).toEqual([]);
+});
+
 test("results can be screened with the keyboard", async ({ page }) => {
   await installMockApi(page);
   await page.goto("/projects/1/results");
@@ -92,6 +248,59 @@ test("results can be screened with the keyboard", async ({ page }) => {
   await expect(reason).toBeFocused();
   await page.keyboard.press("Enter");
   await expect(page.getByRole("button", { name: /Re-include "Simulation-based feedback/ })).toBeVisible();
+});
+
+test("results exclusion records the PRISMA screening stage with the keyboard", async ({ page }) => {
+  await installMockApi(page);
+  await page.goto("/projects/1/results");
+
+  await page.getByRole("button", { name: /Exclude "Simulation-based feedback/ }).focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("menu", { name: /title \/ abstract stage/i })).toBeVisible();
+  const titleAbstract = page.getByRole("menuitemradio", { name: "Title / abstract" });
+  const fullText = page.getByRole("menuitemradio", { name: "Full text" });
+  const firstReason = page.getByRole("menuitem", { name: "Wrong study design" });
+  await expect(titleAbstract).toHaveAttribute("aria-checked", "true");
+  await expect(fullText).toHaveAttribute("aria-checked", "false");
+  await expect(firstReason).toBeFocused();
+
+  await page.keyboard.press("ArrowUp");
+  await expect(fullText).toBeFocused();
+  await page.keyboard.press("Space");
+  await expect(fullText).toHaveAttribute("aria-checked", "true");
+  await expect(titleAbstract).toHaveAttribute("aria-checked", "false");
+  await expect(page.getByRole("menu", { name: /full text stage/i })).toBeVisible();
+
+  await page.keyboard.press("ArrowDown");
+  await expect(firstReason).toBeFocused();
+  const patch = page.waitForRequest((r) => r.method() === "PATCH" && r.url().endsWith("/publications/1/exclude"));
+  await page.keyboard.press("Enter");
+  expect((await patch).postDataJSON()).toEqual({ reason: "wrong_study_design", screening_stage: "full_text" });
+  await expect(page.getByRole("button", { name: /Re-include "Simulation-based feedback/ })).toBeVisible();
+  await expect(page.getByText("Full text stage")).toBeVisible();
+
+  // The chosen stage carries over to the next record's picker.
+  await page.getByRole("button", { name: /Exclude "Learning analytics/ }).focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("menuitemradio", { name: "Full text" })).toHaveAttribute("aria-checked", "true");
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("menu")).toBeHidden();
+});
+
+test("full-text-unavailable exclusions are always recorded at the full-text stage", async ({ page }) => {
+  await installMockApi(page);
+  await page.goto("/projects/1/results");
+
+  await page.getByRole("button", { name: /Exclude "Simulation-based feedback/ }).focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("menuitemradio", { name: "Title / abstract" })).toHaveAttribute("aria-checked", "true");
+  const unavailable = page.getByRole("menuitem", { name: /Full-text not retrievable.*Always recorded at the full-text stage/ });
+  await expect(unavailable).toBeVisible();
+
+  const patch = page.waitForRequest((r) => r.method() === "PATCH" && r.url().endsWith("/publications/1/exclude"));
+  await unavailable.click();
+  expect((await patch).postDataJSON()).toEqual({ reason: "fulltext_unavailable", screening_stage: "full_text" });
+  await expect(page.getByText("Full text stage")).toBeVisible();
 });
 
 test("dashboard tabs change the visible analysis section", async ({ page }) => {

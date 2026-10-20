@@ -22,6 +22,7 @@ const publications = [
     citation_count: 64,
     excluded: false,
     exclusion_reason: null,
+    screening_stage: null,
     journal_name: "Medical Education Practice",
     authors: [
       { id: 1, name: "Elena Garcia Sample", orcid: null },
@@ -39,6 +40,7 @@ const publications = [
     citation_count: 51,
     excluded: false,
     exclusion_reason: null,
+    screening_stage: null,
     journal_name: "Digital Health Education",
     authors: [{ id: 3, name: "Marcus Chen Sample", orcid: null }],
   },
@@ -96,6 +98,7 @@ export const analysisResults: Record<string, Record<string, unknown>> = {
       start_year: 2018,
       end_year: 2020,
       excluded_current_year: false,
+      excluded_future_years: false,
       reason: null,
     },
   },
@@ -130,6 +133,39 @@ export const analysisResults: Record<string, Record<string, unknown>> = {
         { id: 2, name: "Elena Garcia Sample", pub_count: 4 },
       ],
       links: [{ source: 1, target: 2, weight: 2 }],
+    },
+    lotka: {
+      distribution: [
+        { papers: 2, authors: 1 },
+        { papers: 3, authors: 2 },
+        { papers: 4, authors: 4 },
+        { papers: 5, authors: 1 },
+      ],
+      total_authors: 8,
+      productivity_levels: 4,
+      fit: {
+        alpha: -0.4143,
+        C: 1.02,
+        r_squared: 0.061,
+        goodness_of_fit: {
+          test: "kolmogorov-smirnov",
+          significance_level: 0.01,
+          D: null,
+          critical_value: null,
+          consistent_with_lotka: null,
+          expected_single_paper_share: null,
+          reason: "The fitted alpha is -0.4143; the Lotka distribution only sums to 1 for alpha > 1.",
+        },
+      },
+      reason: null,
+      method: "Lotka's law (Lotka 1926): least-squares fit of log10(authors) on log10(papers); K-S test (Pao 1985)",
+      parameters: {
+        counting: "complete",
+        min_productivity_levels: 3,
+        significance_level: 0.01,
+        ks_coefficient: 1.63,
+        ks_min_authors: 36,
+      },
     },
   },
   countries: {
@@ -220,6 +256,7 @@ export interface MockApiOptions {
   readOnly?: boolean;
   configUnavailable?: boolean;
   missingAnalyses?: string[];
+  sampleSearch?: boolean;
 }
 
 export async function installMockApi(page: Page, options: MockApiOptions = {}) {
@@ -228,6 +265,7 @@ export async function installMockApi(page: Page, options: MockApiOptions = {}) {
   const writeRequests: string[] = [];
   let exclusionReason: string | null = null;
   let uncitedExcluded = false;
+  let screeningStage: string | null = null;
 
   // Keep E2E deterministic and offline: icon-font availability must not turn
   // an application-flow test into a third-party network test.
@@ -276,7 +314,12 @@ export async function installMockApi(page: Page, options: MockApiOptions = {}) {
       ]);
     }
     if (pathname === "/api/projects/1/search/latest" && method === "GET") {
-      return json(route, searchStatus("completed"));
+      return json(
+        route,
+        options.sampleSearch
+          ? { ...searchStatus("completed"), query_string: sampleQueryString, database: "sample" }
+          : searchStatus("completed"),
+      );
     }
     if (pathname === "/api/projects/1/search" && method === "POST") {
       return json(route, searchStatus("running"), 202);
@@ -291,22 +334,35 @@ export async function installMockApi(page: Page, options: MockApiOptions = {}) {
         items: [
           ...publications.map((publication) =>
             publication.id === 1
-              ? { ...publication, excluded: Boolean(exclusionReason), exclusion_reason: exclusionReason }
+              ? {
+                  ...publication,
+                  excluded: Boolean(exclusionReason),
+                  exclusion_reason: exclusionReason,
+                  screening_stage: screeningStage,
+                }
               : publication,
           ),
-          uncitedExcluded ? { ...uncitedPublication, excluded: true, exclusion_reason: "other" } : uncitedPublication,
+          uncitedExcluded
+            ? { ...uncitedPublication, excluded: true, exclusion_reason: "other", screening_stage: "title_abstract" }
+            : uncitedPublication,
         ],
       });
     }
     if (/^\/api\/projects\/1\/publications\/\d+\/exclude$/.test(pathname) && method === "PATCH") {
-      const body = request.postDataJSON() as { reason?: string } | null;
+      const body = request.postDataJSON() as { reason?: string; screening_stage?: string } | null;
       exclusionReason = exclusionReason ? null : (body?.reason ?? "other");
-      return json(route, { id: 1, excluded: Boolean(exclusionReason), exclusion_reason: exclusionReason });
+      screeningStage = exclusionReason ? (body?.screening_stage ?? "title_abstract") : null;
+      return json(route, {
+        id: 1,
+        excluded: Boolean(exclusionReason),
+        exclusion_reason: exclusionReason,
+        screening_stage: screeningStage,
+      });
     }
     if (pathname === "/api/projects/1/publications/bulk-exclude" && method === "POST") {
       const newlyExcluded = uncitedExcluded ? 0 : 1;
       uncitedExcluded = true;
-      return json(route, { excluded_count: newlyExcluded, reason: "other" });
+      return json(route, { excluded_count: newlyExcluded, reason: "other", screening_stage: "title_abstract" });
     }
     const analysisMatch = pathname.match(/^\/api\/projects\/1\/analysis\/([^/]+)$/);
     if (analysisMatch && (method === "GET" || method === "POST")) {
@@ -344,6 +400,9 @@ export async function installMockApi(page: Page, options: MockApiOptions = {}) {
 
   return { writeRequests };
 }
+
+export const sampleQueryString =
+  '("Education, Medical"[Mesh] OR "medical education"[tiab]) AND ("Artificial Intelligence"[Mesh] OR "machine learning"[tiab] OR "generative AI"[tiab] OR "learning analytics"[tiab] OR "simulation"[tiab] OR "virtual patient*"[tiab]) AND ("2018/01/01"[PDAT] : "2025/12/31"[PDAT])';
 
 function searchStatus(status: string) {
   return {

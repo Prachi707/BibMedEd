@@ -1,19 +1,45 @@
 import logging
+from typing import Annotated
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query
+from fastapi.exceptions import RequestValidationError
 from sqlalchemy.orm import Session, joinedload
 from bibmeded.database import get_db
 from bibmeded.models import Publication, SearchProject
+from bibmeded.models.screening import REVIEWER_LABEL_MAX_LENGTH
 from bibmeded.schemas.publication import (
+    REVIEWER_HEADER,
+    REVIEWER_HEADER_DESCRIPTION,
+    REVIEWER_LABEL_PATTERN,
+    STAGE_CONTRADICTION_MESSAGE,
     BulkExcludeRequest,
+    BulkExcludeResponse,
     PublicationListResponse,
     PublicationResponse,
     ToggleExcludeRequest,
+    ToggleExcludeResponse,
+)
+from bibmeded.services.screening import (
+    INCLUDED,
+    TOGGLE_SOURCE,
+    ScreeningState,
+    apply_screening_state,
+    exclude_by_citation_threshold,
 )
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/projects/{project_id}/publications", tags=["publications"])
+
+ReviewerLabel = Annotated[
+    str | None,
+    Header(
+        alias=REVIEWER_HEADER,
+        pattern=REVIEWER_LABEL_PATTERN,
+        max_length=REVIEWER_LABEL_MAX_LENGTH,
+        description=REVIEWER_HEADER_DESCRIPTION,
+    ),
+]
 
 @router.get("", response_model=PublicationListResponse)
 def list_publications(project_id: int, sort_by: str = Query("year", enum=["year", "title", "citation_count"]),
@@ -31,9 +57,11 @@ def list_publications(project_id: int, sort_by: str = Query("year", enum=["year"
     sort_col = getattr(Publication, sort_by, Publication.year)
     if order == "desc":
         sort_col = sort_col.desc()
+        id_col = Publication.id.desc()
     else:
         sort_col = sort_col.asc()
-    publications = base_query.order_by(sort_col).offset(offset).limit(limit).all()
+        id_col = Publication.id.asc()
+    publications = base_query.order_by(sort_col, id_col).offset(offset).limit(limit).all()
     items = []
     skipped = 0
     for pub in publications:
@@ -42,7 +70,7 @@ def list_publications(project_id: int, sort_by: str = Query("year", enum=["year"
                 id=pub.id, pmid=pub.pmid or "", doi=pub.doi, title=pub.title or "Untitled",
                 abstract=pub.abstract, year=pub.year, publication_type=pub.publication_type,
                 citation_count=pub.citation_count, excluded=pub.excluded,
-                exclusion_reason=pub.exclusion_reason,
+                exclusion_reason=pub.exclusion_reason, screening_stage=pub.screening_stage,
                 journal_name=pub.journal.name if pub.journal else None,
                 authors=[{"id": a.id, "name": a.name, "orcid": a.orcid} for a in pub.authors],
             )
@@ -55,52 +83,84 @@ def list_publications(project_id: int, sort_by: str = Query("year", enum=["year"
     return PublicationListResponse(total=total, excluded_count=excluded_count, items=items)
 
 
-@router.post("/bulk-exclude")
-def bulk_exclude(project_id: int, body: BulkExcludeRequest, db: Session = Depends(get_db)):
-    """Exclude all publications with citation_count below threshold; stamps every
-    affected row with the supplied PRISMA exclusion reason."""
+@router.post("/bulk-exclude", response_model=BulkExcludeResponse)
+def bulk_exclude(
+    project_id: int,
+    body: BulkExcludeRequest,
+    reviewer: ReviewerLabel = None,
+    db: Session = Depends(get_db),
+):
+    """Exclude all publications with citation_count at or below the threshold; stamps
+    every affected row with the supplied PRISMA exclusion reason and screening stage
+    (stage rule in ``schemas.publication._StagedExclusionRequest``) and logs one
+    screening decision per excluded publication."""
     project = db.get(SearchProject, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     query_ids = [q.id for q in project.queries]
     if not query_ids:
-        return {"excluded_count": 0, "reason": body.reason}
-    updated = (
-        db.query(Publication)
-        .filter(
-            Publication.query_id.in_(query_ids),
-            Publication.excluded == False,
-            (Publication.citation_count == None) | (Publication.citation_count <= body.citation_threshold),
-        )
-        .update(
-            {Publication.excluded: True, Publication.exclusion_reason: body.reason},
-            synchronize_session="fetch",
-        )
+        return BulkExcludeResponse(excluded_count=0, reason=body.reason, screening_stage=body.resolved_screening_stage)
+    updated = exclude_by_citation_threshold(
+        db,
+        project_id=project.id,
+        query_ids=query_ids,
+        citation_threshold=body.citation_threshold,
+        target=ScreeningState(True, body.reason, body.resolved_screening_stage),
+        reviewer=reviewer,
     )
     db.commit()
-    return {"excluded_count": updated, "reason": body.reason}
+    return BulkExcludeResponse(excluded_count=updated, reason=body.reason, screening_stage=body.resolved_screening_stage)
 
 
-@router.patch("/{publication_id}/exclude")
+@router.patch("/{publication_id}/exclude", response_model=ToggleExcludeResponse)
 def toggle_exclude(
     project_id: int,
     publication_id: int,
     body: ToggleExcludeRequest | None = Body(default=None),
+    reviewer: ReviewerLabel = None,
     db: Session = Depends(get_db),
 ):
+    """Toggle a publication between included and excluded. Excluding records the
+    PRISMA reason (default ``other``) and screening stage (``full_text`` for
+    ``fulltext_unavailable``, else ``title_abstract``, unless given) and rejects
+    ``fulltext_unavailable`` at ``title_abstract`` with 422; re-including clears
+    both and ignores the body. Each toggle logs one screening decision."""
     project = db.get(SearchProject, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    pub = db.get(Publication, publication_id)
+    # Locked on Postgres so two concurrent toggles log consecutive states rather
+    # than two decisions that both start from the same snapshot. FOR NO KEY
+    # UPDATE is enough because only non-key columns change, and it does not block
+    # the worker's KEY SHARE locks from inserting author and keyword links.
+    pub = db.get(Publication, publication_id, with_for_update={"key_share": True})
     if not pub:
         raise HTTPException(status_code=404, detail="Publication not found")
     project_query_ids = {q.id for q in project.queries}
     if pub.query_id not in project_query_ids:
         raise HTTPException(status_code=404, detail="Publication not found")
-    pub.excluded = not pub.excluded
+    body = body or ToggleExcludeRequest()
+    if not pub.excluded and body.contradicts_stage_rule:
+        # Same response shape as a Pydantic body error, which is what this check
+        # returned while it was a model validator.
+        raise RequestValidationError(
+            [
+                {
+                    "type": "value_error",
+                    "loc": ("body",),
+                    "msg": f"Value error, {STAGE_CONTRADICTION_MESSAGE}",
+                    "input": body.model_dump(exclude_unset=True),
+                }
+            ]
+        )
     if pub.excluded:
-        pub.exclusion_reason = (body.reason if body else None) or "other"
+        target = INCLUDED
     else:
-        pub.exclusion_reason = None
+        target = ScreeningState(True, body.reason or "other", body.resolved_screening_stage)
+    apply_screening_state(db, pub, target, reviewer=reviewer, source=TOGGLE_SOURCE)
     db.commit()
-    return {"id": pub.id, "excluded": pub.excluded, "exclusion_reason": pub.exclusion_reason}
+    return ToggleExcludeResponse(
+        id=pub.id,
+        excluded=pub.excluded,
+        exclusion_reason=pub.exclusion_reason,
+        screening_stage=pub.screening_stage,
+    )
