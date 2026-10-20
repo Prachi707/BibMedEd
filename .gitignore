@@ -17,9 +17,6 @@ build/
 *.egg-info/
 __pycache__/
 .pytest_cache/
-<<<<<<< HEAD
-desktop.ini
-=======
 
 # OS and notebook artifacts
 desktop.ini
@@ -27,4 +24,3 @@ Thumbs.db
 .DS_Store
 .ipynb_checkpoints/
 sample_project_export.zip
->>>>>>> upstream/master
